@@ -1,13 +1,9 @@
 #lang eopl
-; Exercise 3.26 [**]  In our data-structure representation of procedures, we have kept the entire environment
-; in the closure. But of course all we need are the bindings for the free variables.
-; Modify the representation of procedures to retain only the free variables.
-
-; filter the env according to the body of the procedure and eliminate duplicate variables.
-; our data structure representation of environment is hard to iterate. Moreover,
-; the `define-datatype` is very limited, for example, we can't `cases` two values at the same time.
-; so finally we choose not to use `define-datatype` to represent the environment
-
+; Exercise 3.32/33 [**] Extend the Language to allow the declaration of any number of mututally recursive procedures
+; Exercise 3.35 [*] The representations we have seen so far are inefficient,
+; because they build a new closure every time the procedure is retrieved.
+; But the closure is the same every time. We can build the closures only once,
+; by putting the value in a vector of length 1 and building an explicit circular structure.
 
 ;ExpVal = Int+Bool+Null+Pair+Proc
 ;DenVal = Int+Bool+Null+Pair+Proc
@@ -25,12 +21,16 @@
 ;               let-exp (vars exps body)
 ;Expression ::= let* {Identifier = Expression}* in Expression
 ;               let*-exp (vars exps body)
+;Expression ::= letrec {Identifier ({Identifier}*) = Expression}* in Expression
+;               letrec-exp (p-names b-varss p-bodys letrec-body)
 ;Expression ::= cond {Expression ==> Expression}∗ end
 ;               cond-exp (preds actions)
 ;Expression ::= unpack {Identifier}∗ = Expression in Expression
 ;               unpack-exp (vars exp1 exp2)
 ;Expression ::= proc ({Identifier}*) Expression
 ;               proc-exp (vars body)
+;Expression ::= traceproc ({Identifier}*) Expression
+;               traceproc-exp (vars body)
 ;Expression ::= (Expression {Expression}*)
 ;               call-exp (rator rands)
 ;Operation  ::= +|-|*|/|equal?|greater?|less?|minus|cons|car|cdr|null?|list|print
@@ -57,10 +57,12 @@
     (expression (identifier) var-exp)
     (expression ("let" (arbno identifier "=" expression) "in" expression) let-exp)
     (expression ("let*" (arbno identifier "=" expression) "in" expression) let*-exp)
+    (expression ("letrec" (arbno identifier "(" (arbno identifier) ")" "=" expression) "in" expression) letrec-exp)
     (expression ("emptylist") null-exp)
     (expression ("cond" (arbno expression "==>" expression) "end") cond-exp)
     (expression ("unpack" (arbno identifier) "=" expression "in" expression) unpack-exp)
     (expression ("proc" "(" (arbno identifier) ")" expression) proc-exp)
+    (expression ("traceproc" "(" (arbno identifier) ")" expression) traceproc-exp)
     (expression ("(" expression  (arbno expression) ")") call-exp)
     ))
 
@@ -85,7 +87,7 @@
 
 ; procedure
 (define-datatype proc proc?
-  (compound (vars (list-of identifier?)) (body expression?) (env env?))
+  (compound (vars (list-of identifier?)) (body expression?) (env env?) (trace boolean?))
   (primitive (name identifier?) (op procedure?)))
 
 ; used by print
@@ -96,7 +98,10 @@
     (null-val () '())
     (pair-val (a d) (cons (expval->sexp a) (expval->sexp d)))
     (proc-val (a-proc) (cases proc a-proc
-                         (compound (vars body env) (string->symbol "#<procedure>"))
+                         (compound (vars body env trace)
+                                   (if trace
+                                       (string->symbol "#<traceproc>")
+                                       (string->symbol "#<procedure>")))
                          (primitive (name op) (string->symbol (string-append "#<primitive:"
                                                                              (symbol->string name) ">")))))))
 
@@ -150,55 +155,34 @@
 ; any: predicate that always returns true
 (define (any val) #t)
 
-(define (binding? b) (and (pair? b) (identifier? (car b))))
+(define-datatype env-type env?
+  (empty-env)
+  (extend-env (var identifier?)
+              (val any)
+              (env env?)))
+(define (extend-env-rec p-names b-varss bodys saved-env)
+  (let* ((vecs (map (lambda (n) (make-vector 1)) p-names))
+         (new-env (fold/l (lambda (env name vec) (extend-env name vec env)) saved-env p-names vecs)))
+    (for-each (lambda (vec b-vars body)
+                (vector-set! vec 0 (proc-val (compound b-vars body new-env #f))))
+              vecs b-varss bodys)
+    new-env))
 
-(define (check-arg-type name pred arg)
-  (if (pred arg)
-      #t
-      (eopl:error 'check-arg-type "expected ~s, got ~s" name arg)))
-
-(define (empty-env) '(environment ()))
-(define (env? x) (and (pair? x) (eq? (car x) 'environment) ((list-of binding?) (cadr x))))
-(define (env-bindings env)
-  (check-arg-type 'env? env? env)
-  (cadr env))
-
-(define (extend-env var val env)
-  (check-arg-type 'identifier? identifier? var)
-  (check-arg-type 'env? env? env)
-  (list 'environment (cons (cons var val) (env-bindings env))))
-  
-(define (scan-env env search-var onsucc onfail)
-  (check-arg-type 'env? env? env)
-  (let ((b (ormap (lambda (b) (if (eqv? (car b) search-var) b #f)) (env-bindings env))))
-    (if b (onsucc b) (onfail search-var))))
-
-; if found, return the val; otherwise report error
 (define (apply-env env search-var)
-  (scan-env env search-var cdr report-no-binding-found))
+  (cases env-type env
+    (empty-env () (report-no-binding-found search-var))
+    (extend-env (var val saved-env) (if (eqv? var search-var)
+                                        (if (expval? val)
+                                            val
+                                            (vector-ref val 0))
+                                        (apply-env saved-env search-var)))))
 
-; if found, returns the binding; otherwise returns #f
-(define (lookup-binding env search-var)
-  (scan-env env search-var (lambda (b) b) (lambda (v) #f)))
-
-; merge multiple envs, eliminate the duplicate bindings 
-(define (merge-envs env1 env2 . envs)
-  (check-arg-type 'env? env? env1)
-  (check-arg-type 'env? env? env2)
-  (check-arg-type 'list-of-env? (list-of env?) envs)
-  (define (merge-bindings bs1 bs2)
-    (cond
-      ((null? bs1) bs2)
-      ((null? bs2) bs1)
-      (else (fold/l (lambda (bs b) (if (assq (car b) bs)
-                                       bs
-                                       (cons b bs)))
-                    bs1 bs2))))
-  (list 'environment
-        (fold/l (lambda (bs env)
-                  (merge-bindings bs (env-bindings env)))
-                (merge-bindings (env-bindings env1) (env-bindings env2))
-                envs)))
+(define (has-binding? env search-var)
+  (cases env-type env
+    (empty-env () #f)
+    (extend-env (var val saved-env)
+                (or (eqv? var search-var)
+                    (has-binding? saved-env search-var)))))
 
 ; TODO: check duplicate vars
 (define (extend-env+ vars vals env)
@@ -211,46 +195,15 @@
       env
       (extend-env* (cdr vars) (cdr exps) (extend-env (car vars) (value-of (car exps) env) env))))
 
-; filter the env to keep only the bindings for the free variables of the expresison
-; note for let-exp/let*-exp/proc ..., we need to add those vars into bound variables
-; there seems to be no need for sorting. The absolute position doesn' mean much.
-(define (filter-env vars exp env)
-  (let loop ((vars vars)
-             (exp exp))
-    (cases expression exp
-      (const-exp (num) (empty-env))
-      (var-exp (var) (if (memq var vars)
-                         (empty-env)
-                         (let ((b (lookup-binding env var)))
-                           (if b (extend-env var (cdr b) (empty-env)) (empty-env)))))
-      (if-exp (exp1 exp2 exp3) (merge-envs (loop vars exp1) (loop vars exp2) (loop vars exp3)))
-      (let-exp (vars2 exps body) (merge-envs (apply merge-envs (map (lambda (exp) (loop vars exp)) exps))
-                                            (loop (append vars vars2) body)))
-      (let*-exp (vars2 exps body) (car (fold/l (lambda (env&vars var exp)
-                                                        (cons (merge-envs (car env&vars)
-                                                                          (loop (cdr env&vars) exp))
-                                                              (cons var (cdr env&vars))))
-                                                      (cons (loop (append vars vars2) body) vars)
-                                                      vars2 exps)))
-      (null-exp () (empty-env))
-      (cond-exp (preds actions) (apply merge-envs (map (lambda (exp) (loop vars exp)) (append preds actions))))
-      (unpack-exp (vars2 exp1 body) (merge-envs (loop vars exp1) (loop (append vars vars2) body)))
-      (proc-exp (vars2 body) (loop (append vars vars2) body))
-      (call-exp (rator rands) (fold/l (lambda (env rand)
-                                        (merge-envs env (loop vars rand)))
-                                      (loop vars rator)
-                                      rands))
-      )))
-
 ;init-env : () → Env
 ;usage: (init-env) = [i=1,v=5,x=10,true=true,false=false,+=.,-=.,...]
 (define (init-env)
   (extend-env+ '(i v x  true false)
-                (list (num-val 1) (num-val 5) (num-val 10) true false)
-     (fold/l (lambda (env p)
-               (let ((name (car p))
-                     (op (cdr p)))
-                 (extend-env name (proc-val (primitive name op)) env))) (empty-env) primitives)))
+               (list (num-val 1) (num-val 5) (num-val 10) true false)
+               (fold/l (lambda (env p)
+                         (let ((name (car p))
+                               (op (cdr p)))
+                           (extend-env name (proc-val (primitive name op)) env))) (empty-env) primitives)))
 
 ; evaluation
 ;run : String → ExpVal ->Sexp
@@ -279,7 +232,9 @@
                          (extend-env+ vars (value-of-explist exps env) env)))
       (let*-exp (vars exps body)
                 (value-of body
-                         (extend-env* vars exps env)))
+                          (extend-env* vars exps env)))
+      (letrec-exp (p-names b-varss p-bodys letrec-body)
+                  (value-of letrec-body (extend-env-rec p-names b-varss p-bodys env)))
       (null-exp () (null-val))
       (cond-exp (preds actions)
                 (value-of-cond preds actions env))
@@ -289,7 +244,8 @@
                     (if (equal-length? vars vals)
                         (value-of body (extend-env+ vars vals env))
                         (eopl:error 'unpack "the length of the list doesn't match the number of variables"))))
-      (proc-exp (vars body) (proc-val (compound vars body (filter-env vars body env))))
+      (proc-exp (vars body) (proc-val (compound vars body env #f)))
+      (traceproc-exp (vars body) (proc-val (compound vars body env #t)))
       (call-exp (rator rands)
                 (let ((a-proc (expval->proc (value-of rator env)))
                       (args (value-of-explist rands env)))
@@ -308,13 +264,21 @@
       (else (iter (cdr preds) (cdr actions)))))
   (iter preds actions))
 
+(define (check-arity vars args)
+  (let ((l1 (length vars))
+        (l2 (length args)))
+    (if (not (= l1 l2))
+        (eopl:error 'apply-procedure "arity mismatch, expected ~s, got ~s" l1 l2)
+        #t)))
+
 (define (apply-procedure proc1 args)
   (cases proc proc1
-    (compound (vars body env)
-               (if (equal-length? vars args)
-                   (value-of body (extend-env+ vars args env))
-                   (eopl:error 'apply-procedure "arity mismatch, expected ~s, got ~s"
-                               (length vars) (length args))))
+    (compound (vars body env trace)
+              (if trace (display "enter procedure\n") #t)
+              (check-arity vars args)
+              (let ((res (value-of body (extend-env+ vars args env))))
+                (if trace (display "exit procedure\n") #t)
+                res))
     (primitive (name op) (apply op args))))
 
 ; primitives
@@ -433,18 +397,6 @@
                                    (list (apply fold/r op init (cdr lst1) (map cdr lsts)))
                                    lsts))))
 
-(define (andmap op lst)
-  (let loop ((lst lst))
-    (if (null? lst)
-        #t
-        (and (op (car lst)) (loop (cdr lst))))))
-
-(define (ormap op lst)
-  (let loop ((lst lst))
-    (if (null? lst)
-        #f
-        (or (op (car lst)) (loop (cdr lst))))))
-
 (define (equal-length? l1 l2)
   (= (length l1) (length l2)))
 
@@ -453,41 +405,8 @@
                         (sllgen:make-stream-parser scanner-spec grammar)))
 
 ; test
-;> (run "3")
-;3
-;> (run "x")
-;10
-;> (run "if (zero? 0) then i else x")
+;> (run "letrec
+;               even(x) = if (zero? x) then 1 else (odd (- x 1))
+;               odd(x) = if (zero? x) then 0 else (even (- x 1))
+;        in (odd 13)")
 ;1
-;> (run "if (zero? 1) then i else x")
-;10
-;> (run "let a = 2 x = 5 in (cons a x)")
-;(2 . 5)
-;> (run "let* a = 2 b = (+ a 1) in (cons b x)")
-;(3 . 10)
-;> (run "emptylist")
-;()
-;> (run "unpack a b c = (list 1 2 3) in (list a b c)")
-;(1 2 3)
-;> (run "(proc (x) x 2)")
-;2
-;> (run "(cons 1 x)")
-;(1 . 10)
-;> (run "let f = proc (x y) (+ x y) in (f 3 1)")
-;4
-;> (run "let makerec = proc (f)
-;                      (proc (h) (h h)
-;                       proc (h) (f proc (x) ((h h) x)))
-;      in let maketimes4 = proc (f)
-;                            proc (x)
-;                              if (zero? x)
-;                              then 0
-;                              else (+ (f (- x 1)) 4)
-;         in let times4 = (makerec maketimes4)
-;            in (times4 3)
-;      ")
-;12
-;> (run "unpack a b c = (list 1 2 3) in let* x = 4 y =5 in let f = proc(m n) proc(o p) (list a b c x y m n o p) in ((f 10 20) 30 40)")
-;(1 2 3 4 5 10 20 30 40)
-;> (run "unpack a b c = (list 1 2 3) in let* x = 4 y =5 in let f = proc(m n) let a= 0 x = 6 in proc(o p) (list a b c x y m n o p) in ((f 10 20) 30 40)")
-;(0 2 3 6 5 10 20 30 40)
