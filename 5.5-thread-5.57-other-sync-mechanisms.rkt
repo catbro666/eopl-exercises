@@ -1,17 +1,12 @@
 #lang eopl
-; Thread (based on Exercise 5.54)
-; Exercise 5.55 [**]  Add to the interpreter of exercise 5.53 an interthread communication
-;facility, in which each thread can send a value to another thread using its thread
-;identifier. A thread can receive messages when it chooses, blocking if no message has
-;been sent to it.
+; Thread (based on Exercise 5.55)
+; Exercise 5.57 [***] There are lots of different synchronization mechanisms in your
+;favorite OS book. Pick three and implement them in this framework.
 
-; Big Change!!
-; Add many new fields in the thread structure and change them to reference type (mutable).
-; Change the mutex implementation so that only the holder can release the mutex
-; Also add the semaphore implementation so that everybody can signal.
+; we already added semaphore. now we add condition variable and waittid
 
 ;Bounce = ExpVal ∪ (() → Bounce)
-;ExpVal = Int+Bool+Null+Pair+Proc+Mutex+Semaphore
+;ExpVal = Int+Bool+Null+Pair+Proc+Mutex+Semaphore+CondVar
 ;DenVal = Ref(ExpVal)
  
 ;syntax
@@ -61,10 +56,20 @@
 ;               mutex-exp
 ;Expression ::= semaphore Expression
 ;               semaphore-exp (exp1)
+;Expression ::= condvar
+;               condvar-exp
 ;Expression ::= wait Expression
 ;               wait-exp (exp1)
 ;Expression ::= singal Expression
 ;               signal-exp (exp1)
+;Expression ::= waitcond Expression Expression
+;               waitcond-exp (condexp procexp)
+;Expression ::= waitcondmutex Expression Expression Expression ; wait on cond and unlock the mutex, then acquire the mutex before returning .
+;               waitcondmutex-exp (condexp mtxexp procexp)
+;Expression ::= notifyone Expression
+;               notifyone-exp (exp1)
+;Expression ::= notifyall Expression
+;               notifyall-exp (exp1)
 ;Expression ::= kill Expression
 ;               kill-exp (exp1)
 ;Expression ::= nop Expression
@@ -73,6 +78,8 @@
 ;               send-exp (exp1 exp2)
 ;Expression ::= recv
 ;               recv-exp ()
+;Expression ::= waittid Expression ; wait the child thread specified by the id. 0 means all, 1 means any one
+;               waittid-exp (exp1)
 ;Expression ::= (Expression {Expression}*)
 ;               call-exp (rator rands)
 ;Operation  ::= +|-|*|/|equal?|greater?|less?|minus|cons|car|cdr|null?|list|print
@@ -119,12 +126,18 @@
     (expression ("set" identifier "=" expression) set-exp)
     (expression ("mutex") mutex-exp)
     (expression ("semaphore" expression) semaphore-exp)
+    (expression ("condvar") condvar-exp)
     (expression ("wait" expression) wait-exp)
     (expression ("signal" expression) signal-exp)
+    (expression ("waitcond" expression expression) waitcond-exp)
+    (expression ("waitcondmutex" expression expression expression) waitcondmutex-exp)
+    (expression ("notifyone" expression) notifyone-exp)
+    (expression ("notifyall" expression) notifyall-exp)
     (expression ("kill" expression) kill-exp)
     (expression ("nop" expression) nop-exp)
     (expression ("send" expression "to" expression) send-exp)
     (expression ("recv") recv-exp)
+    (expression ("waittid" expression) waittid-exp)
     (expression ("(" expression  (arbno expression) ")") call-exp)
     ))
 
@@ -148,7 +161,8 @@
   (proc-val (proc proc?))
   (cont-val (cont continuation?))
   (mutex-val (a-mutex mutex?))
-  (semaphore-val (a-semaphore semaphore?)))
+  (semaphore-val (a-semaphore semaphore?))
+  (condvar-val (a-condvar condvar?)))
 
 ; procedure
 (define-datatype proc proc?
@@ -166,6 +180,10 @@
    (ref-to-count reference?)
    (ref-to-wait-queue reference?)))
 
+(define-datatype condvar condvar?
+  (a-condvar
+   (ref-to-wait-queue reference?)))
+
 ; ====thread====
 (define-datatype thread thread?
   (a-thread
@@ -175,14 +193,15 @@
    (ref-time-remaining reference?) ; reference of the integer
    (ref-buffer reference?) ; reference of the buffer used to receive message from other threads
    (buffer-mtx mutex?)     ; mutex of the buffer
-   (ref-state reference?) ;reference of the current state of the thread: running, ready, waiting-mutex, waiting-msg
+   (ref-state reference?) ;reference of the current state of the thread: running, ready, waiting-mutex, waiting-msg, waiting-condvar, waiting-child, zombie, dead
    (ref-waiting-lock reference?) ; reference of the mutex/semaphore that the thread is currently waiting for
    (ref-holding-mutexes reference?) ; reference of the mutexes that the thread is currently holding
+   (ref-children reference?) ; reference of the child threads (queue)
    ))
 
 (define (get-thread-field th field)
   (cases thread th
-    (a-thread (id pid ref-thunk ref-time-remaining ref-buffer buffer-mtx ref-state ref-waiting-lock ref-holding-mutexes)
+    (a-thread (id pid ref-thunk ref-time-remaining ref-buffer buffer-mtx ref-state ref-waiting-lock ref-holding-mutexes ref-children)
               (case field
                 ((id) id)
                 ((pid) pid)
@@ -193,6 +212,7 @@
                 ((state) (deref ref-state))
                 ((waiting-lock) (deref ref-waiting-lock))
                 ((holding-mutexes) (deref ref-holding-mutexes))
+                ((children) (deref ref-children))
                 (else (eopl:error 'get-thread-field "invalid field ~s to get" field))))))
 
 (define (get-thread-id th) (get-thread-field th 'id))
@@ -204,10 +224,11 @@
 (define (get-thread-state th) (get-thread-field th 'state))
 (define (get-thread-waiting-lock th) (get-thread-field th 'waiting-lock))
 (define (get-thread-holding-mutexes th) (get-thread-field th 'holding-mutexes))
+(define (get-thread-children th) (get-thread-field th 'children))
 
 (define (set-thread-field th field val)
   (cases thread th
-    (a-thread (id pid ref-thunk ref-time-remaining ref-buffer buffer-mtx ref-state ref-waiting-lock ref-holding-mutexes)
+    (a-thread (id pid ref-thunk ref-time-remaining ref-buffer buffer-mtx ref-state ref-waiting-lock ref-holding-mutexes ref-children)
               (case field
                 ((thunk) (setref! ref-thunk val))
                 ((time-remaining) (setref! ref-time-remaining val))
@@ -215,6 +236,7 @@
                 ((state) (setref! ref-state val))
                 ((waiting-lock) (setref! ref-waiting-lock val))
                 ((holding-mutexes) (setref! ref-holding-mutexes val))
+                ((children) (setref! ref-children val))
                 (else (eopl:error 'set-thread-field "invalid field ~s to set" field))))))
 
 (define (set-thread-thunk th val) (set-thread-field th 'thunk val))
@@ -223,6 +245,7 @@
 (define (set-thread-state th val) (set-thread-field th 'state val))
 (define (set-thread-waiting-lock th val) (set-thread-field th 'waiting-lock val))
 (define (set-thread-holding-mutexes th val) (set-thread-field th 'holding-mutexes val))
+(define (set-thread-children th val) (set-thread-field th 'children val))
 
 
 (define (insert-mutex mtx mtxes)
@@ -244,16 +267,22 @@
   (let ((mutexes (get-thread-holding-mutexes th)))
     (set-thread-holding-mutexes the-current-thread (remove-mutex mtx mutexes))))
 
+(define (add-child th child)
+  (let ((children (get-thread-children th)))
+    (set-thread-children th (cons child children))))
+
 (define (new-thread pid thunk)
   (let* ((id (new-thread-id))
          (th (a-thread id (or pid id)
                        (newref thunk)
                        (newref the-max-time-slice)
-                       (newref (empty-queue))
-                       (new-mutex)
-                       (newref #f)
-                       (newref #f)
-                       (newref '()))))
+                       (newref (empty-queue)) ;buffer
+                       (new-mutex) ;buffer-mutex
+                       (newref #f) ;state
+                       (newref #f) ;waiting-lock
+                       (newref '()) ;holding-mutexes
+                       (newref '()) ;children
+                       )))
     (insert-thread id th)
     th))
 
@@ -274,6 +303,58 @@
     (if res
         (cdr res)
         res)))
+
+(define (notify-parent-if-wait th)
+  (let* ((p (find-thread (get-thread-pid th)))
+         (state (get-thread-state p)))
+    (if (eq? state 'waiting-child)
+        (place-on-ready-queue! p)
+        (nop))))
+
+(define (wait-child id cont)
+  ; returns #f if no children or all children are dead, the specified id isn't a child or not existent.
+  ; returns the thread id(or #t when waiting all children) if the specified child(ren) is/are over
+  ; otherwise, suspend the thread again
+  (let* ((children (get-thread-children the-current-thread))
+         (has-non-dead (ormap (lambda (c) (not (eq? 'dead (get-thread-state c)))) children)))
+    (if (not has-non-dead)
+        (apply-cont cont false)
+        (case id
+          ((0) (if (andmap (lambda (c)
+                             (let ((state (get-thread-state c)))
+                               (case state
+                                 ((dead) #t)
+                                 ((zombie) (set-thread-state c 'dead) #t)
+                                 (else #f))))
+                           children)
+                   (apply-cont cont true)
+                   (continue-wait-child id cont))) ; all
+          ((1) (let ((cid (ormap (lambda (c)
+                                  (let ((state (get-thread-state c)))
+                                    (case state
+                                      ((zombie) (set-thread-state c 'dead) (get-thread-id c))
+                                      (else #f))))
+                                children)))
+                 (if cid
+                     (apply-cont cont (num-val cid))
+                     (continue-wait-child id cont)))) ; any
+          (else (let ((c (find-thread id))) ; specified one
+                  (if c
+                      (let ((pid (get-thread-pid c))
+                            (id (current-thread-id)))
+                        (if (eq? pid id)
+                            (let ((state (get-thread-state c)))
+                              (case state
+                                ((zombie) (set-thread-state c 'dead) (apply-cont cont (num-val (get-thread-id c))))
+                                ((dead) (apply-cont cont false))
+                                (else (continue-wait-child id cont))))
+                            (apply-cont cont false)))
+                      (apply-cont cont false))))))))
+
+(define (continue-wait-child id cont)
+  (set-thread-thunk the-current-thread (lambda () (wait-child id cont)))
+  (set-thread-state the-current-thread 'waiting-child)
+  (run-next-thread))
 
 (define next-thread-id 0)
 (define (new-thread-id)
@@ -314,7 +395,13 @@
        ((let* ((sem (get-thread-waiting-lock th))
                (wait-queue (get-semaphore-wait-queue sem)))
           (set-semaphore-wait-queue sem (remove-thread-from-queue wait-queue th)))))
-      )))
+      ((waiting-condvar)
+       ((let* ((cond (get-thread-waiting-lock th))
+               (wait-queue (get-condvar-wait-queue cond)))
+          (set-condvar-wait-queue cond (remove-thread-from-queue wait-queue th)))))
+      )
+    (set-thread-state th 'zombie)
+    (notify-parent-if-wait th)))
 
 ;interthread communication
 (define (send-message tid expval cont)
@@ -364,7 +451,8 @@
                          (cwccproc (saved-cont) (string->symbol "#<cwccproc>"))))
     (cont-val (cont) (string->symbol "#<continuation>"))
     (mutex-val (a-mutex) (string->symbol "#<mutex>"))
-    (semaphore-val (a-semaphore) (string->symbol "#<semaphore"))))
+    (semaphore-val (a-semaphore) (string->symbol "#<semaphore>"))
+    (condvar-val (a-condvar) (string->symbol "#<condvar>"))))
 
 ;expval->num : ExpVal → Int
 (define (expval->num val)
@@ -395,6 +483,18 @@
   (cases expval val
     (mutex-val (a-mutex) a-mutex)
     (else (report-expval-extractor-error 'mutex val))))
+
+;expval->semaphore : ExpVal → Semaphore
+(define (expval->semaphore val)
+  (cases expval val
+    (semaphore-val (a-semaphore) a-semaphore)
+    (else (report-expval-extractor-error 'semaphore val))))
+
+;expval->condvar : ExpVal → CondVar
+(define (expval->condvar val)
+  (cases expval val
+    (condvar-val (a-condvar) a-condvar)
+    (else (report-expval-extractor-error 'condvar val))))
 
 ;expval->list : ExpVal → List
 ;convert only 1 layer. If val is not a list-val, reports error
@@ -535,8 +635,13 @@
       (set-exp (var exp1) (value-of/k exp1 env (set-cont (apply-env env var) cont (get-saved-try-cont cont))))
       (mutex-exp () (apply-cont cont (mutex-val (new-mutex))))
       (semaphore-exp (exp1) (value-of/k exp1 env (semaphore-cont cont (get-saved-try-cont cont))))
+      (condvar-exp () (apply-cont cont (condvar-val (new-condvar))))
       (wait-exp (exp1) (value-of/k exp1 env (wait-cont cont (get-saved-try-cont cont))))
       (signal-exp (exp1) (value-of/k exp1 env (signal-cont cont (get-saved-try-cont cont))))
+      (waitcond-exp (exp1 procexp) (value-of/k exp1 env (waitcond-cont procexp env cont (get-saved-try-cont cont))))
+      (waitcondmutex-exp (condexp mtxexp procexp) (value-of/k condexp env (waitcondmutex-cont mtxexp procexp env cont (get-saved-try-cont cont))))
+      (notifyone-exp (exp1) (value-of/k exp1 env (notifyone-cont cont (get-saved-try-cont cont))))
+      (notifyall-exp (exp1) (value-of/k exp1 env (notifyall-cont cont (get-saved-try-cont cont))))
       (kill-exp (exp1) (value-of/k exp1 env (kill-cont cont (get-saved-try-cont cont))))
       (call-exp (rator rands)
                 (value-of/k rator env
@@ -544,6 +649,7 @@
       (nop-exp (exp1) (value-of/k exp1 env (nop-cont cont (get-saved-try-cont cont))))
       (send-exp (exp1 exp2) (value-of/k exp1 env (send-cont exp2 env cont (get-saved-try-cont cont))))
       (recv-exp () (recv-message cont))
+      (waittid-exp (exp1) (value-of/k exp1 env (waittid-cont cont (get-saved-try-cont cont))))
       )))
 
 ;====continuation====
@@ -667,6 +773,41 @@
    (saved-try-cont continuation?))
   (semaphore-cont
    (saved-cont continuation?)
+   (saved-try-cont continuation?))
+  (waitcond-cont
+   (procexp expression?)
+   (saved-env env?)
+   (saved-cont continuation?)
+   (saved-try-cont continuation?))
+  (waitcond-cont2
+   (saved-condvar condvar?)
+   (saved-cont continuation?)
+   (saved-try-cont continuation?))
+  (waitcondmutex-cont
+   (mtxexp expression?)
+   (procexp expression?)
+   (saved-env env?)
+   (saved-cont continuation?)
+   (saved-try-cont continuation?))
+  (waitcondmutex-cont2
+   (saved-condvar condvar?)
+   (procexp expression?)
+   (saved-env env?)
+   (saved-cont continuation?)
+   (saved-try-cont continuation?))
+  (waitcondmutex-cont3
+   (saved-condvar condvar?)
+   (saved-mutex mutex?)
+   (saved-cont continuation?)
+   (saved-try-cont continuation?))
+  (notifyone-cont
+   (saved-cont continuation?)
+   (saved-try-cont continuation?))
+  (notifyall-cont
+   (saved-cont continuation?)
+   (saved-try-cont continuation?))
+  (waittid-cont
+   (saved-cont continuation?)
    (saved-try-cont continuation?)))
 
 ;apply-cont : Cont × ExpVal → Bounce
@@ -729,6 +870,7 @@
                                                                        (end-subthread-cont)))))
                              (id (get-thread-id nth)))
                         (place-on-ready-queue! nth)
+                        (add-child the-current-thread nth)
                         (apply-cont saved-cont (num-val id)))))
         (end-main-thread-cont ()
                               (set-final-answer! val)
@@ -766,7 +908,34 @@
         (send-cont2 (saved-val saved-cont saved-try-cont)
                     (send-message (expval->num val) saved-val saved-cont))
         (semaphore-cont (saved-cont saved-try-cont)
-                        (apply-cont saved-cont (semaphore-val (new-semaphore (expval->num val))))))
+                        (apply-cont saved-cont (semaphore-val (new-semaphore (expval->num val)))))
+        (waitcond-cont (procexp saved-env saved-cont saved-try-cont)
+                       (value-of/k procexp saved-env (waitcond-cont2 (expval->condvar val) saved-cont saved-try-cont)))
+        (waitcond-cont2 (saved-condvar saved-cont saved-try-cont)
+                        (let ((proc (expval->proc val)))
+                          (set-thread-thunk the-current-thread (lambda () (apply-procedure/k proc '() saved-cont)))
+                          (wait-for-condvar saved-condvar the-current-thread)))
+        (waitcondmutex-cont (mtxexp procexp saved-env saved-cont saved-try-cont)
+                            (value-of/k mtxexp saved-env (waitcondmutex-cont2 (expval->condvar val) procexp saved-env saved-cont saved-try-cont)))
+        (waitcondmutex-cont2 (saved-condvar procexp saved-env saved-cont saved-try-cont)
+                             (value-of/k procexp saved-env (waitcondmutex-cont3 saved-condvar (expval->mutex val) saved-cont saved-try-cont)))
+        (waitcondmutex-cont3 (saved-condvar saved-mutex saved-cont saved-try-cont)
+                             (let ((proc (expval->proc val)))
+                               (set-thread-thunk the-current-thread
+                                                 (lambda ()
+                                                   (set-thread-thunk the-current-thread
+                                                                     (lambda () (apply-procedure/k proc '() saved-cont)))
+                                                   (wait-for-mutex saved-mutex the-current-thread)))
+                               (wait-for-condvar-mutex saved-condvar saved-mutex the-current-thread)))
+        (notifyone-cont (saved-cont saved-try-cont)
+                        (notifyone-condvar (expval->condvar val))
+                        (apply-cont saved-cont (num-val 56)))
+        (notifyall-cont (saved-cont saved-try-cont)
+                        (notifyall-condvar (expval->condvar val))
+                        (apply-cont saved-cont (num-val 57)))
+        (waittid-cont (saved-cont saved-try-cont)
+                      (let ((id (expval->num val)))
+                        (wait-child id saved-cont))))
       ; run out of time
       (begin (set-thread-thunk the-current-thread (lambda () (apply-cont cont val)))
              (set-thread-time-remaining the-current-thread the-max-time-slice)
@@ -805,6 +974,14 @@
     (send-cont (saved-exp saved-env saved-cont saved-try-cont) saved-try-cont)
     (send-cont2 (saved-val saved-cont saved-try-cont) saved-try-cont)
     (semaphore-cont (saved-cont saved-try-cont) saved-try-cont)
+    (waitcond-cont (procexp saved-env saved-cont saved-try-cont) saved-try-cont)
+    (waitcond-cont2 (saved-condvar saved-cont saved-try-cont) saved-try-cont)
+    (waitcondmutex-cont (mtxexp procexp saved-env saved-cont saved-try-cont) saved-try-cont)
+    (waitcondmutex-cont2 (saved-condvar procexp saved-env saved-cont saved-try-cont) saved-try-cont)
+    (waitcondmutex-cont3 (saved-condvar saved-mutex saved-cont saved-try-cont) saved-try-cont)
+    (notifyone-cont (saved-cont saved-try-cont) saved-try-cont)
+    (notifyall-cont (saved-cont saved-try-cont) saved-try-cont)
+    (waittid-cont (saved-cont saved-try-cont) saved-try-cont)
     ))
 
 ;apply-handler : ExpVal × Cont → FinalAnswer
@@ -974,7 +1151,7 @@
 
 (define (run-thread th)
   (cases thread th
-    (a-thread (id pid ref-thunk ref-time-remaining ref-buffer buffer-mtx ref-state ref-waiting-mutex ref-holding-mutexes)
+    (a-thread (id pid ref-thunk ref-time-remaining ref-buffer buffer-mtx ref-state ref-waiting-mutex ref-holding-mutexes ref-children)
               (let ((thunk (deref ref-thunk)))
                 (setref! ref-thunk #f)
                 ;(display "run thread ")
@@ -1060,7 +1237,7 @@
           (remove-holding-mutex th m)
           (if (empty? wait-queue)
               (begin ;(display " no holder now\n")
-                     (set-mutex-holder m #f))
+                (set-mutex-holder m #f))
               (dequeue wait-queue
                        (lambda (first-waiting-th other-waiting-ths)
                          ;(display (get-thread-id first-waiting-th))
@@ -1124,10 +1301,10 @@
           (set-thread-state th 'waiting-semaphore)
           (run-next-thread))
         (begin ;(display count)
-               ;(display "left\n")
-               (run-thread th)))))
+          ;(display "left\n")
+          (run-thread th)))))
 
-;signal-semaphore : Semaphore → ()
+;signal-semaphore : Semaphore × thread → ()
 (define (signal-semaphore sem)
   (let ((count (inc-semaphore-count sem))
         (wait-queue (get-semaphore-wait-queue sem)))
@@ -1146,6 +1323,85 @@
                    (set-semaphore-wait-queue sem others)
                    (set-thread-waiting-lock first #f)))
         (nop))))
+
+; ====condvar====
+;new-condvar : () → CondVar
+(define (new-condvar)
+  (a-condvar (newref (empty-queue))))
+
+(define (get-condvar-field cond field)
+  (cases condvar cond
+    (a-condvar (ref-to-wait-queue)
+               (case field
+                 ((wait-queue) (deref ref-to-wait-queue))))))
+
+(define (get-condvar-wait-queue cond) (get-condvar-field cond 'wait-queue))
+
+(define (set-condvar-field cond field val)
+  (cases condvar cond
+    (a-condvar (ref-to-wait-queue)
+               (case field
+                 ((wait-queue) (setref! ref-to-wait-queue val))))))
+
+(define (set-condvar-wait-queue cond val) (set-condvar-field cond 'wait-queue val))
+
+;wait-for-condvar : CondVar × Thread → FinalAnswer
+;usage: waits for condvar
+(define (wait-for-condvar c th)
+  (let ((wait-queue (get-condvar-wait-queue c)))
+    ;(display (get-thread-id th))
+    ;(display " wait for condvar \n")
+    (set-condvar-wait-queue c (enqueue wait-queue th))
+    (set-thread-waiting-lock th c)
+    (set-thread-state th 'waiting-condvar)
+    (run-next-thread)))
+
+;wait-for-condvar-mutex : CondVar × Mutex × Thread → FinalAnswer
+;usage: waits for condvar
+(define (wait-for-condvar-mutex c m th)
+  (let ((wait-queue (get-condvar-wait-queue c)))
+    ;(display (get-thread-id th))
+    ;(display " wait for condvar(unlock) \n")
+    (signal-mutex m th)
+    (set-condvar-wait-queue c (enqueue wait-queue th))
+    (set-thread-waiting-lock th c)
+    (set-thread-state th 'waiting-condvar)
+    (run-next-thread)))
+
+;notifyone-condvar : CondVar → ()
+(define (notifyone-condvar c)
+  ;(display (current-thread-id))
+  ;(display " notifyone-condvar ")
+  (let ((wait-queue (get-condvar-wait-queue c)))
+    (if (empty? wait-queue)
+        (begin ;(display " no one is waiting for the condvar\n")
+          #t)
+        (dequeue wait-queue
+                 (lambda (first others)
+                   ;(display "wake up ")
+                   ;(display (get-thread-id first))
+                   ;(newline)
+                   (set-condvar-wait-queue c others)
+                   (place-on-ready-queue! first)
+                   (set-thread-waiting-lock first #f))))))
+
+;notifyall-condvar : CondVar → ()
+(define (notifyall-condvar c)
+  ;(display (current-thread-id))
+  ;(display " notifyall-condvar ")
+  (let loop ((q (get-condvar-wait-queue c)))
+    (if (empty? q)
+        #t
+        (dequeue q
+                 (lambda (first rest)
+                   ;(display "wake up ")
+                   ;(display (get-thread-id first))
+                   ;(newline)
+                   (set-condvar-wait-queue c rest)
+                   (place-on-ready-queue! first)
+                   (set-thread-waiting-lock first #f)
+                   (loop rest))))))
+
 
 ; ====primitives====
 ; arithmetic operations
@@ -1262,6 +1518,15 @@
                                      (cons (car lst) args))
                                    (list (apply fold/r op init (cdr lst1) (map cdr lsts)))
                                    lsts))))
+(define (ormap op lst1)
+  (if (null? lst1)
+      #f
+      (or (op (car lst1)) (ormap op (cdr lst1)))))
+
+(define (andmap op lst1)
+  (if (null? lst1)
+      #t
+      (and (op (car lst1)) (andmap op (cdr lst1)))))
 
 (define (filter pred lst . lsts)
   (reverse (apply fold/l (lambda (res e . l)
@@ -1429,7 +1694,10 @@
          in let incr_x = proc (id)
                           proc (dummy)
                            begin wait wtmut
-                                 set x = (+ x 1)
+                                 let tmp = x
+                                 in begin yield
+                                          set x = (+ tmp 1)
+                                    end
                                  signal wtmut
                                  signal sem
                            end
@@ -1469,3 +1737,191 @@
 ;kill id1: 100 200 300 #t 201 302 2
 ;kill id2: 100 200 300 #t 101 302 2
 ;kill id3: 100 200 300 #t 101 202 2
+
+(run "let x = 0
+          cv = condvar
+      in let fn = proc (id)
+                    begin
+                     set x = id
+                     nop 100
+                     notifyone cv
+                    end
+          in begin spawn fn
+                   (print waitcond cv proc () x)
+             end")
+;2
+
+(run "let cv = condvar
+          sem = semaphore 0
+      in let fn = proc (id)
+                   begin waitcond cv proc () (print id)
+                         signal sem
+                   end
+         in begin spawn fn
+                  spawn fn
+                  spawn fn
+                  yield
+                  notifyall cv
+                  wait sem
+                  wait sem
+                  wait sem
+                  (print 1)
+            end")
+;2 3 4 1
+
+(run "let cv = condvar
+          mtx = mutex
+          endsem = semaphore 0
+          x = false
+      in let init = proc (dummy)
+                     begin wait mtx
+                           set x = 0
+                           yield
+                           yield
+                           yield
+                           notifyall cv
+                           signal mtx
+                           signal endsem
+                     end
+             inc = proc (dummy)
+                    begin wait mtx
+                          (print waitcondmutex cv mtx proc () begin set x = (+ x 1) x end)
+                          signal mtx
+                          signal endsem
+                    end
+         in begin spawn inc
+                  spawn inc
+                  spawn inc
+                  spawn inc
+                  spawn init
+                  wait endsem
+                  wait endsem
+                  wait endsem
+                  wait endsem
+                  wait endsem
+                  (print 0)
+            end")
+; 1 2 3 4 0
+
+(run "let x = 0
+      in let wtmut = mutex
+         in let incr_x = proc (id)
+                          proc (dummy)
+                           begin wait wtmut
+                                 let tmp = x
+                                 in begin yield
+                                          set x = (+ tmp 1)
+                                    end
+                                 signal wtmut
+                           end
+            in let id1 = spawn (incr_x 100)
+                   id2 = spawn (incr_x 200)
+                   id3 = spawn (incr_x 300)
+               in begin (print waittid 0)
+                        (print x)
+                  end")
+;#t 3
+
+(run "let x = 0
+      in let wtmut = mutex
+         in let incr_x = proc (id)
+                          proc (dummy)
+                           begin wait wtmut
+                                 let tmp = x
+                                 in begin yield
+                                          set x = (+ tmp 1)
+                                    end
+                                 signal wtmut
+                           end
+            in let id1 = spawn (incr_x 100)
+                   id2 = spawn (incr_x 200)
+                   id3 = spawn (incr_x 300)
+               in begin (print waittid id1)
+                        (print waittid id2)
+                        (print waittid id3)
+                        (print x)
+                  end")
+; 2 3 4 3
+
+(run "let x = 0
+      in let wtmut = mutex
+         in let incr_x = proc (id)
+                          proc (dummy)
+                           begin wait wtmut
+                                 let tmp = x
+                                 in begin yield
+                                          set x = (+ tmp 1)
+                                    end
+                                 signal wtmut
+                           end
+            in let id1 = spawn (incr_x 100)
+                   id2 = spawn (incr_x 200)
+                   id3 = spawn (incr_x 300)
+               in begin (print waittid 1)
+                        (print waittid 1)
+                        (print waittid 1)
+                        (print x)
+                  end")
+; 2 3 4 3
+
+(run "let x = 0
+      in let wtmut = mutex
+         in let incr_x = proc (id)
+                          proc (dummy)
+                           begin wait wtmut
+                                 let tmp = x
+                                 in begin yield
+                                          set x = (+ tmp 1)
+                                    end
+                                 signal wtmut
+                           end
+            in let id1 = spawn (incr_x 100)
+                   id2 = spawn (incr_x 200)
+                   id3 = spawn (incr_x 300)
+               in begin (print waittid 1)
+                        (print waittid 0)
+                        (print x)
+                  end")
+; 2 #t 3
+
+(run "let x = 0
+      in let wtmut = mutex
+         in let incr_x = proc (id)
+                          proc (dummy)
+                           begin wait wtmut
+                                 let tmp = x
+                                 in begin yield
+                                          set x = (+ tmp 1)
+                                    end
+                                 signal wtmut
+                           end
+            in let id1 = spawn (incr_x 100)
+                   id2 = spawn (incr_x 200)
+                   id3 = spawn (incr_x 300)
+               in begin (print waittid 10)
+                        (print waittid 0)
+                        (print x)
+                  end")
+; #f #t 3
+
+(run "let x = 0
+      in let wtmut = mutex
+         in let incr_x = proc (id)
+                          proc (dummy)
+                           begin wait wtmut
+                                 let tmp = x
+                                 in begin yield
+                                          set x = (+ tmp 1)
+                                    end
+                                 signal wtmut
+                           end
+            in let id1 = spawn (incr_x 100)
+                   id2 = spawn (incr_x 200)
+                   id3 = spawn (incr_x 300)
+               in begin (print waittid 0)
+                        (print waittid 0)
+                        (print waittid 1)
+                        (print waittid 2)
+                        (print x)
+                  end")
+;#t #f #f #f 3
